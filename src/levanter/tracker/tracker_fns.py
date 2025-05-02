@@ -33,7 +33,7 @@ def log(metrics: typing.Mapping[str, LoggableValues | Any], *, step: Optional[in
     Args:
         metrics: Metrics to log. We use LoggableValues just to give you a sense of what you can log. Backends may
             support additional types.
-        step: Step to log at
+        step: Step to log at. If None, uses the default for the tracker.
         commit: Whether to commit the metrics. If None, uses the default for the tracker.
     """
     global _global_tracker
@@ -128,10 +128,13 @@ def log_configuration(hparams: Any, config_name: Optional[str] = None):
     if dataclasses.is_dataclass(hparams):
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = os.path.join(tmpdir, "config.yaml")
-            with open(config_path, "w") as f:
-                draccus.dump(hparams, f, encoding="utf-8")
-                name = config_name or "config.yaml"
-                _global_tracker.log_artifact(config_path, name=name, type="config")
+            try:
+                with open(config_path, "w") as f:
+                    draccus.dump(hparams, f, encoding="utf-8")
+                    name = config_name or "config.yaml"
+                    _global_tracker.log_artifact(config_path, name=name, type="config")
+            except Exception:  # noqa
+                logger.warning("Failed to dump config to yaml. Skipping logging as artifact.")
 
 
 def set_global_tracker(tracker: Tracker):

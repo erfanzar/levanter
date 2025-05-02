@@ -69,8 +69,8 @@ class DataLoader(Iterable[Ex]):
         *,
         batch_axis_name: str | None = None,
         max_buffered_batches: Optional[int] = 64,
-        mesh: Mesh,
-        axis_resources: Optional[ResourceMapping],
+        mesh: Mesh | None = None,
+        axis_resources: Optional[ResourceMapping] = None,
         prefetch_size: int = 32,
         pad_final_batch: bool = True,
         allow_nondivisible_batch_size: bool = False,
@@ -99,6 +99,9 @@ class DataLoader(Iterable[Ex]):
         self.prefetch_size = prefetch_size
         self.axis_resources = axis_resources
         self.data_store = data
+
+        if mesh is None:
+            mesh = hax.partitioning._get_mesh()
         self.mesh = mesh
 
         if isinstance(batch_size, hax.Axis):
@@ -125,7 +128,7 @@ class DataLoader(Iterable[Ex]):
                 logger.warning("Data store currently has no data. We will block until data is available.")
 
             initial_example = blocking_wait(self.data_store.getitem_async(0))
-            self._ex_leaves, self._ex_structure = jax.tree_flatten(initial_example, is_leaf=is_named_array)
+            self._ex_leaves, self._ex_structure = jax.tree.flatten(initial_example, is_leaf=is_named_array)
             self._padding_example = _make_padding_example(initial_example)
 
         if not self._allow_non_divisible_batch_size:
@@ -217,7 +220,9 @@ class DataLoader(Iterable[Ex]):
     def __len__(self):
         if not self.has_len():
             raise ValueError("DataLoader has no length")
-        return blocking_wait(self.data_store.async_len())
+        total_length = blocking_wait(self.data_store.current_len())
+        step = self.scheduler.find_step_containing_offset(total_length) + 1
+        return step
 
 
 class DataLoaderIterator(Iterator[Ex]):
@@ -263,13 +268,11 @@ class DataLoaderIterator(Iterator[Ex]):
 
             if max_achievable_batch_number < target_next_batch_number:
                 done = True
-            else:
-                assert final_batch_size is None
 
             next_batch_numbers = list(range(batch_number, min(target_next_batch_number, max_achievable_batch_number)))
 
             if len(next_batch_numbers) == 0:
-                logger.info(f"Breaking because no more data available at batch number {batch_number}")
+                logger.debug(f"Breaking because no more data available at batch number {batch_number}")
                 break
 
             batches = [
@@ -292,7 +295,7 @@ class DataLoaderIterator(Iterator[Ex]):
 
             batch_number = next_batch_numbers[-1] + 1
 
-        logger.info(f"DataLoaderIterator finished at batch number {batch_number}")
+        logger.debug(f"DataLoaderIterator finished at batch number {batch_number}")
 
     async def _dataset_get_available_batch_number(self, target_max_batch_number: int) -> tuple[int, Optional[int]]:
         """
@@ -314,13 +317,17 @@ class DataLoaderIterator(Iterator[Ex]):
             if available_len < next_end:
                 target_max_batch_number = self.dl.scheduler.find_step_containing_offset(available_len)
                 next_end = self.dl.scheduler.global_data_offset_by_step(target_max_batch_number)
-                logger.info(f"Data store exhausted after {target_max_batch_number} batches.")
+                logger.debug(f"Data store exhausted after {target_max_batch_number} batches.")
 
             # if we are padding the final batch, we want to see if there is data past the end of the last batch
-            if at_the_end and self.dl._pad_final_batch and available_len > next_end:
-                partial_batch_size = available_len - next_end
-                logger.info(f"Partial batch size: {partial_batch_size}")
-                return target_max_batch_number + 1, partial_batch_size
+            if at_the_end and self.dl._pad_final_batch:
+                if available_len > next_end:
+                    partial_batch_size = available_len - next_end
+                    logger.debug(f"Partial batch size: {partial_batch_size}")
+                    return target_max_batch_number + 1, partial_batch_size
+                else:
+                    # exact match
+                    return target_max_batch_number, None
 
         return target_max_batch_number, None
 
@@ -427,7 +434,10 @@ class DataLoaderIterator(Iterator[Ex]):
         indices_for_this_batch_of_batches: list[int] = [
             i for indices in global_indices_for_each_batch for i in indices
         ]
-        individual_datums = await self._fetch_with_logging(indices_for_this_batch_of_batches)
+        individual_datums = await self.run_and_report_slowness(
+            self.dl.data_store.get_batch(indices_for_this_batch_of_batches),
+            f"Waiting for {len(indices_for_this_batch_of_batches)} items.",
+        )
 
         # unflatten
         global_map: dict[int, Ex] = {}
@@ -453,17 +463,18 @@ class DataLoaderIterator(Iterator[Ex]):
         else:
             return hax.partitioning.pspec_for_axis(shape_spec.shape, self.dl.axis_resources)  # type: ignore
 
-    async def _fetch_with_logging(self, indices):
+    async def run_and_report_slowness(self, coro, description: str):
         threshold = 10.0
-        task = asyncio.create_task(self.dl.data_store.get_batch(indices))
+        task = asyncio.create_task(coro)
 
         async def watchdog():
+            total = 0.0
 
             while not task.done():
                 await asyncio.sleep(threshold)
+                total += threshold
                 if not task.done():
-                    logging.warning(f"Fetching data is taking longer than {threshold} seconds...")
-                    logging.warning(f"Indices: {indices}")
+                    logging.warning(f"Data loading is taking a long time: {total:.1f} seconds. {description}")
 
         watchdog_task = asyncio.create_task(watchdog())
 

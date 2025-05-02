@@ -147,14 +147,13 @@ reasonable defaults and an "advanced" mode that gives you more control.
 
 See also [Checkpointer](#checkpointer).
 
-| Parameter                    | Description                                       | Default                                    |
-|------------------------------|---------------------------------------------------|--------------------------------------------|
-| `load_checkpoint`            | Whether to load checkpoint from `base_path`       | `None`: load if possible, but don't error. |
-| `load_checkpoint_path`       | Path to load checkpoint from. May be a parent     | `checkpointer.base_path`                   |
-| `initialize_from`            | Path to initialize model from. May be a parent    | `None`                                     |
-| `checkpointer.base_path`     | Base path to save checkpoints to                  | `checkpoints/${run_id}`                    |
-| `checkpointer.save_interval` | How often to save checkpoints (time)              | 15 minutes                                 |
-| `checkpointer.keep`          | How often to keep checkpoints (steps). See below. | 10000 steps                                |
+| Parameter                    | Description                                                                                   | Default                                    |
+|------------------------------|-----------------------------------------------------------------------------------------------|--------------------------------------------|
+| `load_checkpoint`            | Whether to load checkpoint from `base_path`                                                   | `None`: load if possible, but don't error. |
+| `initialize_from`            | Initialize training state from this path. May be a parent dir. Useful for continued training. | `None`                                     |
+| `checkpointer.base_path`     | Base path to save checkpoints to                                                              | `checkpoints/${run_id}`                    |
+| `checkpointer.save_interval` | How often to save checkpoints (time)                                                          | 15 minutes                                 |
+| `checkpointer.keep`          | How often to keep checkpoints (steps). See below.                                             | 10000 steps                                |
 
 #### Checkpointer Save Policy
 
@@ -184,7 +183,7 @@ The default step-based checkpoint policy is to save a checkpoint every 10,000 st
 
 We mostly use [W&B](https://wandb.ai/site) for tracking values and other metadata about a run. However, we also support
 Tensorboard and a few other trackers. You can also use multiple trackers at once, or even write your own.
-See  [Trackers](dev/Trackers.md) for more information.
+See  [Trackers](../reference/Trackers.md) for more information.
 
 ### W&B
 
@@ -420,7 +419,7 @@ We won't go into detail here. You can see the auto-generated docs below.
 
 ### Trackers and Metrics
 
-See also [Trackers](dev/Trackers.md) for more information. Basic configuration is shown below.
+See also [Trackers](../reference/Trackers.md) for more information. Basic configuration is shown below.
 
 #### Single Tracker
 
@@ -432,11 +431,6 @@ trainer:
     entity: my-entity
 ```
 
-
-
-::: levanter.tracker.wandb.WandbConfig
-
-::: levanter.tracker.tensorboard.TensorboardConfig
 
 
 ### Distributed and Ray
@@ -459,5 +453,3 @@ trainer:
 ::: levanter.models.gpt2.Gpt2Config
 
 ::: levanter.models.llama.LlamaConfig
-
-::: levanter.models.mpt.MptConfig

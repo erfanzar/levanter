@@ -105,12 +105,11 @@ class CacheOptions:
 
 def build_or_load_cache(
     cache_dir: str,
-    input_shards: ShardedDataSource[T],
+    source: ShardedDataSource[T],
     processor: BatchProcessor[T, U],
     await_finished: bool = True,
     monitors: Optional[Sequence["MetricsMonitor"]] = None,
     options: CacheOptions = CacheOptions.default(),
-    split: str = "test",
 ) -> "TreeCache[U]":
     """
     Produces a sharded cache of the dataset using Ray for distributed processing. The cache can be any path
@@ -126,7 +125,7 @@ def build_or_load_cache(
 
     Args:
         cache_dir: The directory to write the cache to. This can be any path understood by fsspec.
-        input_shards: A ShardedDataset that will be used to read the input data. Conceptually, it's just a mapping
+        source: A ShardedDataset that will be used to read the input data. Conceptually, it's just a mapping
                     from shard names to iterators over the data in that shard.
         processor: A BatchProcessor that will be used to process batches of data. This is the main place where
                     you can customize the preprocessing pipeline.
@@ -144,10 +143,9 @@ def build_or_load_cache(
     # first see if we need to do anything
     cache = TreeCache.build_or_load(
         cache_dir=cache_dir,
-        shard_source=input_shards,
+        shard_source=source,
         processor=processor,
         options=options,
-        split=split,
     )
 
     if cache.is_finished:
@@ -162,7 +160,7 @@ def build_or_load_cache(
 
     while await_finished:
         try:
-            cache.await_finished(4.0)
+            cache.await_finished(None, await_cleanup=True)
             break
         except TimeoutError:
             pass
@@ -202,7 +200,7 @@ class TreeCache(AsyncDataset[T_co]):
             self._monitor_thread = threading.Thread(target=self._monitor_metrics, daemon=True)
             self._monitor_thread.start()
         else:
-            self._attempt_to_load_store()
+            self._attempt_to_load_store(cache_metadata=True)
             assert self._store_future.done()
 
     @property
@@ -300,7 +298,12 @@ class TreeCache(AsyncDataset[T_co]):
     def load(cache_dir: str, exemplar: T, options: Optional["CacheMetadata"] = None) -> "TreeCache":
         """Loads a cache from disk or an object store. Raises FileNotFoundError if the cache doesn't exist"""
         logger.info(f"Loading cache from {cache_dir}")
+        time_in = time.time()
         ledger = CacheLedger.load(cache_dir, options)
+        time_out = time.time()
+        if time_out - time_in > 4:
+            logger.info(f"Loaded cache ledger in {time_out - time_in:.2f}s")
+
         if not ledger.is_finished:
             raise FileNotFoundError(f"Cache at {cache_dir} is not finished. Use build_or_load to build it.")
         return TreeCache(cache_dir, exemplar, ledger, None)
@@ -311,7 +314,6 @@ class TreeCache(AsyncDataset[T_co]):
         shard_source: ShardedDataSource[T],
         processor: BatchProcessor[T, U],
         options: Optional["CacheOptions"] = None,
-        split: str = "test",
     ) -> "TreeCache[U]":
         if options is None:
             options = CacheOptions.default()
@@ -319,6 +321,7 @@ class TreeCache(AsyncDataset[T_co]):
         try:
             return TreeCache.load(cache_dir, processor.output_exemplar, metadata)
         except FileNotFoundError:
+            logger.info(f"Cache not found at {cache_dir}. Building.")
             broker = _get_builder_actor(
                 cache_dir=cache_dir,
                 shard_source=shard_source,
@@ -389,11 +392,13 @@ class TreeCache(AsyncDataset[T_co]):
         step = slice.step or 1
         return start, step, stop
 
-    def await_finished(self, timeout: Optional[float] = None):
+    def await_finished(self, timeout: Optional[float] = None, await_cleanup: bool = False):
         if self._builder is None:
             return
         x = ray.get(self.finished_sentinel(), timeout=timeout)
-        self._attempt_to_load_store()
+        if await_cleanup:
+            ray.get(self._builder.await_cleanup.remote(), timeout=timeout)
+        self._attempt_to_load_store(cache_metadata=False)
         return x
 
     async def finished(self):
@@ -401,15 +406,15 @@ class TreeCache(AsyncDataset[T_co]):
             return
         x = await self.finished_sentinel()
         # TODO: make an async version of this
-        self._attempt_to_load_store()
+        self._attempt_to_load_store(cache_metadata=False)
         return x
 
-    def _attempt_to_load_store(self):
+    def _attempt_to_load_store(self, cache_metadata):
         if self._store_future.done():
             return
 
         try:
-            store = TreeStore.open(self._exemplar, self.cache_dir, mode="r")
+            store = TreeStore.open(self._exemplar, self.cache_dir, mode="r", cache_metadata=cache_metadata)
         except FileNotFoundError:
             assert self._builder is not None
             ledger = ray.get(self._builder.current_ledger.remote())
@@ -456,7 +461,7 @@ class TreeCache(AsyncDataset[T_co]):
                     else:
                         raise
                 try:
-                    self._attempt_to_load_store()
+                    self._attempt_to_load_store(cache_metadata=False)
                 except FileNotFoundError:
                     pass
             except Exception as e:
@@ -634,8 +639,9 @@ class _TreeStoreCacheBuilder(SnitchRecipient):
         processor: BatchProcessor[T, U],
         options: CacheOptions,
     ):
-        pylogging.basicConfig(level=DEFAULT_LOG_LEVEL, format=LOG_FORMAT)
+        pylogging.basicConfig(format=LOG_FORMAT)
         self.logger = pylogging.getLogger(f"{__name__}.{name}")
+        self.logger.setLevel(DEFAULT_LOG_LEVEL)
         self._finished_promise: asyncio.Future[None] = asyncio.Future()
         try:
             self.source = source
@@ -692,6 +698,10 @@ class _TreeStoreCacheBuilder(SnitchRecipient):
 
     async def finished_sentinel(self):
         await self._finished_promise
+
+    async def await_cleanup(self):
+        if self._cache_writer is not None:
+            await self._cache_writer
 
     async def updated_ledger(self, timeout: float | None = None) -> CacheLedger | TimeoutError:
         """
@@ -754,9 +764,10 @@ class _TreeStoreCacheBuilder(SnitchRecipient):
             if not self._finished_promise.done():
                 self._finished_promise.set_result(None)
 
-            self._cache_writer = None
-
         self._do_notify()
+
+    def _notify_cleanup_finished(self):
+        self._cache_writer = None
 
     def _do_notify(self):
         async def _do_notify_async():
@@ -847,7 +858,8 @@ def _core_writer_task(
     to the cache directory.
 
     """
-    pylogging.basicConfig(level=DEFAULT_LOG_LEVEL, format=LOG_FORMAT)
+    pylogging.basicConfig(format=LOG_FORMAT)
+    logger.setLevel(DEFAULT_LOG_LEVEL)
     logger.info("Starting writer task")
 
     name = str(os.path.join(*cache_dir.split("/")[-2:]))
@@ -966,6 +978,8 @@ def _core_writer_task(
         ray.get(parent._notify_updated_ledger.remote(ledger))
 
         _clean_up_temp_caches(temporary_cache_path)
+        # Fire and forget
+        parent._notify_cleanup_finished.remote()
 
 
 def _clean_up_temp_caches(path):
@@ -1076,7 +1090,7 @@ def _copy_temp_caches_to_final_cache(
 
     # initialize the data offset tree
     permanent_cache = TreeStore.open(processor.output_exemplar, cache_dir, mode="a", cache_metadata=False)
-    data_offset_tree = jax.tree_map(lambda x: x.data_size, permanent_cache.tree)
+    data_offset_tree = jax.tree.map(lambda x: x.data_size, permanent_cache.tree)
 
     total_rows_from_caches = overall_ledger.total_num_rows
     copy_refs: dict[str, ray.ObjectRef] = {}
@@ -1262,7 +1276,7 @@ async def _extend_cache_with_other_cache(
             """Copies **just the data array** from one shard to the permanent cache at a given offset."""
             # TODO: it'd be good if we just didn't expose the full data array (but only the used part)
             data_size = source_array.data_size
-            data = source_array.data[0:data_size]
+            data = source_array.data
 
             # To prevent OOM, copy in smaller batches
             MAX_ELEMS = 1024 * 1024 * 1024
@@ -1317,7 +1331,7 @@ async def _extend_cache_metadata_with_other(
             """Copies **just the data array** from one shard to the permanent cache at a given offset."""
 
             if source_array.shapes is not None:
-                source_shapes = source_array.shapes[0:source_num_rows]
+                source_shapes = source_array.shapes
                 async with ts.Transaction() as txn:
                     dest_shapes = dest_array.shapes
                     assert dest_shapes is not None
@@ -1394,7 +1408,8 @@ def _tokenize_one_shard_group(
     import humanfriendly
 
     logger = pylogging.getLogger("tokenize")
-    pylogging.basicConfig(level=pylogging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    pylogging.basicConfig(format=LOG_FORMAT)
+    logger.setLevel(DEFAULT_LOG_LEVEL)
 
     # restrict shards to the ones we're supposed to process
     # this is a bit hacky but when there are a lot of shards (e.g. SlimPajama 122K),
